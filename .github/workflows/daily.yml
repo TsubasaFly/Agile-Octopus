@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 10:40 = 英国夏令时(BST) 上午 11:40（留出调度缓冲时间）
     # 如果你坚持要试 11:35，可将 40 改为 35
-    - cron: '40 10 * * *'
+    - cron: '2 11 * * *'
   workflow_dispatch:
 
 jobs:
