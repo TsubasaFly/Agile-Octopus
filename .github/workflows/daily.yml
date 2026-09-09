@@ -2,9 +2,9 @@ name: Daily Octopus Agile Slack Alert
 
 on:
   schedule:
-    # 每天早上 07:00 UTC (英国冬令时为 07:00，夏令时为 08:00) 自动运行
-    - cron: '0 7 * * *'
-  workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮立即测试测试
+    # UTC 15:02 = 英国夏令时(BST) 下午 16:02（带 2 分钟偏移，完美避开整点高峰）
+    - cron: '2 15 * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -20,5 +20,5 @@ jobs:
       - name: Run Script
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          OCTOPUS_REGION_CODE: "C" # 改成你的区域字母
+          OCTOPUS_REGION_CODE: "C"
         run: python main.py
