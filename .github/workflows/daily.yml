@@ -1,23 +1,18 @@
 name: Daily Octopus Agile Slack Alert
-
 on:
   schedule:
-    # UTC 10:40 = 英国夏令时(BST) 上午 11:40（留出调度缓冲时间）
-    # 如果你坚持要试 11:35，可将 40 改为 35
+    # UTC 11:02 = 英国夏令时(BST) 中午 12:02
     - cron: '2 11 * * *'
   workflow_dispatch:
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Run Script
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
