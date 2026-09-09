@@ -3,7 +3,7 @@ name: Daily Octopus Agile Slack Alert
 on:
   schedule:
     # UTC 15:02 = 英国夏令时(BST) 下午 16:02（带 2 分钟偏移，完美避开整点高峰）
-    - cron: '2 15 * * *'
+    - ccron: '45 10 * * *'
   workflow_dispatch:
 
 jobs:
