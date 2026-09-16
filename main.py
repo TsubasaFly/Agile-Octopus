@@ -210,7 +210,7 @@ def generate_chart_url(analysis, date_str):
             "scales": {
                 "yAxes": [
                     {
-                        "ticks": {"beginAtZero": False},
+                        "ticks": {"beginAtZero": True},
                         "gridLines": {"color": "rgba(0,0,0,0.06)"},
                     }
                 ],
