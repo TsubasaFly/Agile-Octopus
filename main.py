@@ -3,6 +3,7 @@ from datetime import datetime, time, timedelta, timezone
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -26,15 +27,42 @@ OCTOPUS_METER_SERIAL = os.getenv("OCTOPUS_METER_SERIAL", "")
 # =================================================
 
 
+def create_quickchart_short_url(chart_config, width=740, height=290, bkg="white"):
+    """通过 QuickChart POST /chart/create 生成永久短链接（彻底解决 Slack 3000 字符限制）"""
+    try:
+        post_body = {
+            "backgroundColor": bkg,
+            "width": width,
+            "height": height,
+            "devicePixelRatio": 2,
+            "chart": chart_config,
+        }
+        req = urllib.request.Request(
+            "https://quickchart.io/chart/create",
+            data=json.dumps(post_body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "OctopusAgileSlackBot/3.1",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("success") and res.get("url"):
+                return res["url"]
+    except Exception as e:
+        print(f"提示: 生成 QuickChart 短链接失败，平滑回退长链接: {e}", file=sys.stderr)
+
+    # 兜底回退长链接
+    config_str = urllib.parse.quote(json.dumps(chart_config, separators=(",", ":")))
+    return f"https://quickchart.io/chart?w={width}&h={height}&devicePixelRatio=2&bkg={bkg}&c={config_str}"
+
+
 def fetch_recent_usage_summary():
     """获取前一日（或最近一个完整回传日）的用电量、电费、高峰用电及 48 时段精细列表。
-
     若未配置 API Key 或电表，平滑返回 None，不影响明日电价预报。
     """
     if not (OCTOPUS_API_KEY and OCTOPUS_MPAN and OCTOPUS_METER_SERIAL):
-        print(
-            "提示: 未配置 OCTOPUS_API_KEY / MPAN / METER_SERIAL，跳过昨日用电复盘。"
-        )
+        print("提示: 未配置 OCTOPUS_API_KEY / MPAN / METER_SERIAL，跳过昨日用电复盘。")
         return None
 
     london_tz = ZoneInfo("Europe/London")
@@ -59,40 +87,28 @@ def fetch_recent_usage_summary():
 
         # 1. 抓取用电量
         c_url = f"https://api.octopus.energy/v1/electricity-meter-points/{OCTOPUS_MPAN}/meters/{OCTOPUS_METER_SERIAL}/consumption/?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(
-            c_url, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
-        )
-        auth_header = "Basic " + base64.b64encode(
-            f"{OCTOPUS_API_KEY}:".encode("utf-8")
-        ).decode("utf-8")
+        req = urllib.request.Request(c_url, headers={"User-Agent": "OctopusAgileSlackBot/3.1"})
+        auth_header = "Basic " + base64.b64encode(f"{OCTOPUS_API_KEY}:".encode("utf-8")).decode("utf-8")
         req.add_header("Authorization", auth_header)
 
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
-                c_results = json.loads(resp.read().decode("utf-8")).get(
-                    "results", []
-                )
+                c_results = json.loads(resp.read().decode("utf-8")).get("results", [])
         except Exception as e:
             print(f"获取 {target_date} 用电数据失败: {e}", file=sys.stderr)
             continue
 
         if len(c_results) < 40:
-            print(
-                f"提示: {target_date} 智能电表数据尚未完全同步 (仅 {len(c_results)} 条)，尝试前一日..."
-            )
+            print(f"提示: {target_date} 智能电表数据尚未完全同步 (仅 {len(c_results)} 条)，尝试前一日...")
             continue
 
         # 2. 抓取该日对应电价
         tariff_code = f"E-1R-{PRODUCT_CODE}-{REGION_CODE}"
         r_url = f"https://api.octopus.energy/v1/products/{PRODUCT_CODE}/electricity-tariffs/{tariff_code}/standard-unit-rates/?{urllib.parse.urlencode(params)}"
-        req_r = urllib.request.Request(
-            r_url, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
-        )
+        req_r = urllib.request.Request(r_url, headers={"User-Agent": "OctopusAgileSlackBot/3.1"})
         try:
             with urllib.request.urlopen(req_r, timeout=12) as resp:
-                r_results = json.loads(resp.read().decode("utf-8")).get(
-                    "results", []
-                )
+                r_results = json.loads(resp.read().decode("utf-8")).get("results", [])
         except Exception as e:
             print(f"获取 {target_date} 对应电价失败: {e}", file=sys.stderr)
             continue
@@ -100,12 +116,8 @@ def fetch_recent_usage_summary():
         # 3. 按 UTC 时间戳对齐并计算
         rates_map = {}
         for r in r_results:
-            dt = datetime.fromisoformat(
-                r["valid_from"].replace("Z", "+00:00")
-            ).astimezone(timezone.utc)
-            rates_map[dt.strftime("%Y-%m-%dT%H:%M:%SZ")] = float(
-                r["value_inc_vat"]
-            )
+            dt = datetime.fromisoformat(r["valid_from"].replace("Z", "+00:00")).astimezone(timezone.utc)
+            rates_map[dt.strftime("%Y-%m-%dT%H:%M:%SZ")] = float(r["value_inc_vat"])
 
         total_kwh = 0.0
         total_cost_p = 0.0
@@ -116,9 +128,7 @@ def fetch_recent_usage_summary():
         matched_slots = []
 
         for c in c_results:
-            dt = datetime.fromisoformat(
-                c["interval_start"].replace("Z", "+00:00")
-            ).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(c["interval_start"].replace("Z", "+00:00")).astimezone(timezone.utc)
             key = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             if key in rates_map:
                 matched += 1
@@ -130,7 +140,7 @@ def fetch_recent_usage_summary():
                 rates_sum += rate
 
                 dt_local = dt.astimezone(london_tz)
-                is_peak = 16 <= dt_local.hour < 19
+                is_peak = (16 <= dt_local.hour < 19)
                 if is_peak:
                     peak_kwh += k
                     peak_cost_p += cost
@@ -149,7 +159,7 @@ def fetch_recent_usage_summary():
         mkt_avg = (rates_sum / matched) if matched > 0 else 0
         peak_pct = (peak_kwh / total_kwh * 100) if total_kwh > 0 else 0
         peak_vwap = (peak_cost_p / peak_kwh) if peak_kwh > 0 else 0
-        is_yesterday = target_date == (now.date() - timedelta(days=1))
+        is_yesterday = (target_date == now.date() - timedelta(days=1))
 
         return {
             "date": target_date,
@@ -171,7 +181,7 @@ def fetch_recent_usage_summary():
 
 
 def generate_usage_chart_url(usage_summary):
-    """生成前一日【半小时用电量(柱) vs 实时电价(折线)】高清双轴走势图 URL"""
+    """生成前一日【半小时用电量(柱) vs 实时电价(折线)】高清双轴走势图 URL (短链接)"""
     if not usage_summary:
         return None
     slots = usage_summary.get("slots", [])
@@ -185,7 +195,6 @@ def generate_usage_chart_url(usage_summary):
     bar_colors = []
 
     for i, s in enumerate(slots):
-        # 每隔 2 小时打一个时间标签，并在高峰 16 点与 19 点打标
         if i % 4 == 0:
             labels.append(s["time"][:2])
         elif i == 32:  # 16:00
@@ -289,11 +298,7 @@ def generate_usage_chart_url(usage_summary):
         },
     }
 
-    config_str = urllib.parse.quote(
-        json.dumps(chart_config, separators=(",", ":"))
-    )
-    chart_url = f"https://quickchart.io/chart?w=740&h=290&devicePixelRatio=2&bkg=white&c={config_str}"
-    return chart_url
+    return create_quickchart_short_url(chart_config, width=740, height=290)
 
 
 def fetch_agile_prices():
@@ -319,27 +324,22 @@ def fetch_agile_prices():
     }
     url_tomorrow = f"{base_url}?{urllib.parse.urlencode(params_tomorrow)}"
     req_tomorrow = urllib.request.Request(
-        url_tomorrow, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
+        url_tomorrow, headers={"User-Agent": "OctopusAgileSlackBot/3.1"}
     )
 
     try:
         with urllib.request.urlopen(req_tomorrow, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             results = data.get("results", [])
-            # 只要获取到明天的数据（通常为 48 个半小时时段）
             if results and len(results) >= 24:
                 results.sort(key=lambda x: x["valid_from"])
-                print(
-                    f"成功获取到明天 ({tomorrow}) 全部 {len(results)} 个时段电价！"
-                )
+                print(f"成功获取到明天 ({tomorrow}) 全部 {len(results)} 个时段电价！")
                 return results, tomorrow, True
     except Exception as e:
         print(f"尝试拉取明天电价时提示: {e}", file=sys.stderr)
 
     # 2. 如果明天数据尚未发布，自动回退拉取今天（Today）的数据
-    print(
-        "提示：明天电价尚未发布（通常在英国时间 16:00 左右公布），自动回退显示今日数据。"
-    )
+    print("提示：明天电价尚未发布（通常在英国时间 16:00 左右公布），自动回退显示今日数据。")
     today = now.date()
     start_today = datetime.combine(today, time.min, tzinfo=london_tz)
     end_today = datetime.combine(today, time.max, tzinfo=london_tz)
@@ -351,7 +351,7 @@ def fetch_agile_prices():
     }
     url_today = f"{base_url}?{urllib.parse.urlencode(params_today)}"
     req_today = urllib.request.Request(
-        url_today, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
+        url_today, headers={"User-Agent": "OctopusAgileSlackBot/3.1"}
     )
 
     try:
@@ -413,19 +413,15 @@ def analyze_prices(rates, target_date, is_tomorrow):
     min_slot = min(slots, key=lambda x: x["price"])
     max_slot = max(slots, key=lambda x: x["price"])
 
-    # 1. 负电价与低价时段筛选 (<10p)
     negative_slots = [s for s in slots if s["price"] < 0]
     low_price_slots = [s for s in slots if s["price"] < LOW_PRICE_THRESHOLD]
 
-    # 2. 48 个半小时柱状图数据准备
     chart_labels = []
     chart_prices = []
     chart_colors = []
 
     for s in slots:
         chart_prices.append(round(s["price"], 1))
-
-        # 整点显示小时，半点留空
         if s["from"].minute == 0:
             chart_labels.append(s["from"].strftime("%H"))
         else:
@@ -433,17 +429,16 @@ def analyze_prices(rates, target_date, is_tomorrow):
 
         p = s["price"]
         if p < 0:
-            chart_colors.append("#9B59B6")  # 紫色：负电价
+            chart_colors.append("#9B59B6")
         elif p < LOW_PRICE_THRESHOLD:
-            chart_colors.append("#2ECC71")  # 绿色：<10p 低价
+            chart_colors.append("#2ECC71")
         elif p < 22:
-            chart_colors.append("#3498DB")  # 蓝色：日常平价
+            chart_colors.append("#3498DB")
         elif p < 32:
-            chart_colors.append("#E67E22")  # 橙色：偏贵
+            chart_colors.append("#E67E22")
         else:
-            chart_colors.append("#E74C3C")  # 红色：高峰期
+            chart_colors.append("#E74C3C")
 
-    # 3. 连续 2 小时最佳用电窗口
     best_2h_avg = float("inf")
     best_2h_window = None
     for i in range(len(slots) - 3):
@@ -470,7 +465,7 @@ def analyze_prices(rates, target_date, is_tomorrow):
 
 
 def generate_forecast_chart_url(analysis, date_str):
-    """生成次日 48 根半小时柱状图的高清图表 URL"""
+    """生成次日 48 根半小时柱状图的高清图表 URL (短链接)"""
     day_type = "明日" if analysis["is_tomorrow"] else "全天"
     chart_config = {
         "type": "bar",
@@ -510,11 +505,7 @@ def generate_forecast_chart_url(analysis, date_str):
         },
     }
 
-    config_str = urllib.parse.quote(
-        json.dumps(chart_config, separators=(",", ":"))
-    )
-    chart_url = f"https://quickchart.io/chart?w=740&h=280&devicePixelRatio=2&bkg=white&c={config_str}"
-    return chart_url
+    return create_quickchart_short_url(chart_config, width=740, height=280)
 
 
 def send_to_slack(analysis, usage_summary=None):
@@ -584,9 +575,7 @@ def send_to_slack(analysis, usage_summary=None):
             },
             {
                 "type": "mrkdwn",
-                "text": (
-                    f"*💰 纯电费支出:*\n`£{usage_summary['total_cost_gbp']:.2f}`"
-                ),
+                "text": f"*💰 纯电费支出:*\n`£{usage_summary['total_cost_gbp']:.2f}`",
             },
             {
                 "type": "mrkdwn",
@@ -599,18 +588,16 @@ def send_to_slack(analysis, usage_summary=None):
             {"type": "mrkdwn", "text": f"*🎯 避峰评价:*\n{eval_str}"},
         ]
 
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"{title_tag} *{u_date}*",
-                },
-                "fields": usage_fields,
-            }
-        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{title_tag} *{u_date}*",
+            },
+            "fields": usage_fields,
+        })
 
-        # 嵌入前一日【用电量柱状图 + 电价折线图】双轴图
+        # 嵌入前一日【用电量柱状图 + 电价折线图】双轴图 (短链接)
         usage_chart_url = generate_usage_chart_url(usage_summary)
         if usage_chart_url:
             blocks.append({
@@ -627,26 +614,24 @@ def send_to_slack(analysis, usage_summary=None):
         blocks.append({"type": "divider"})
 
     # ========== 模块 2: 次日电价预报概览 ==========
-    blocks.append(
-        {
-            "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*📊 全天均价:*\n`{analysis['avg']:.1f} p/kWh`",
-                },
-                {"type": "mrkdwn", "text": f"*🧺 连续2小时最佳用电:*\n{best_2h_str}"},
-                {
-                    "type": "mrkdwn",
-                    "text": f"*🟢 {prefix}谷值:*\n`{analysis['min_slot']['price']:.1f} p` ({min_time})",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*🔴 {prefix}峰值:*\n`{analysis['max_slot']['price']:.1f} p` ({max_time})",
-                },
-            ],
-        }
-    )
+    blocks.append({
+        "type": "section",
+        "fields": [
+            {
+                "type": "mrkdwn",
+                "text": f"*📊 全天均价:*\n`{analysis['avg']:.1f} p/kWh`",
+            },
+            {"type": "mrkdwn", "text": f"*🧺 连续2小时最佳用电:*\n{best_2h_str}"},
+            {
+                "type": "mrkdwn",
+                "text": f"*🟢 {prefix}谷值:*\n`{analysis['min_slot']['price']:.1f} p` ({min_time})",
+            },
+            {
+                "type": "mrkdwn",
+                "text": f"*🔴 {prefix}峰值:*\n`{analysis['max_slot']['price']:.1f} p` ({max_time})",
+            },
+        ],
+    })
 
     # 低于 10p 警报模块
     if analysis["low_price_slots"]:
@@ -657,60 +642,54 @@ def send_to_slack(analysis, usage_summary=None):
             if is_tom
             else "💡 _建议安排洗烘衣物、洗碗机、储能电池或电动车充电！_"
         )
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"🚨 *【{prefix}低价特惠】有低于 10p 的半小时时段！*\n"
+                    f"{low_text}\n"
+                    f"> {tip_text}"
+                ),
+            },
+        })
+    else:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
                     "type": "mrkdwn",
                     "text": (
-                        f"🚨 *【{prefix}低价特惠】有低于 10p 的半小时时段！*\n"
-                        f"{low_text}\n"
-                        f"> {tip_text}"
+                        f"ℹ️ {prefix}全天无低于 10p 时段（最低为 `{analysis['min_slot']['price']:.1f} p/kWh`，时段 {min_time}）"
                     ),
-                },
-            }
-        )
-    else:
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"ℹ️ {prefix}全天无低于 10p 时段（最低为 `{analysis['min_slot']['price']:.1f} p/kWh`，时段 {min_time}）",
-                    }
-                ],
-            }
-        )
+                }
+            ],
+        })
 
     # 负电价警报（如有）
     if analysis["negative_slots"]:
         neg_groups = group_consecutive_slots(analysis["negative_slots"])
         neg_text = "\n".join(neg_groups)
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"🔥 *【负电价报警！倒贴用电！】*\n{neg_text}",
-                },
-            }
-        )
-
-    # 次日 48 根半小时柱状图
-    forecast_chart_url = generate_forecast_chart_url(analysis, date_str)
-    blocks.append(
-        {
-            "type": "image",
-            "title": {
-                "type": "plain_text",
-                "text": f"📊 {prefix} 48 个半小时时段电价走势 (绿色为 <10p 低价，红色为高峰)",
-                "emoji": True,
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"🔥 *【负电价报警！倒贴用电！】*\n{neg_text}",
             },
-            "image_url": forecast_chart_url,
-            "alt_text": f"{prefix}48个半小时电价走势图",
-        }
-    )
+        })
+
+    # 次日 48 根半小时柱状图 (短链接)
+    forecast_chart_url = generate_forecast_chart_url(analysis, date_str)
+    blocks.append({
+        "type": "image",
+        "title": {
+            "type": "plain_text",
+            "text": f"📊 {prefix} 48 个半小时时段电价走势 (绿色为 <10p 低价，红色为高峰)",
+            "emoji": True,
+        },
+        "image_url": forecast_chart_url,
+        "alt_text": f"{prefix}48个半小时电价走势图",
+    })
 
     slack_payload = {
         "text": f"Octopus Agile {prefix}电价提醒 ({date_str})",
@@ -727,13 +706,19 @@ def send_to_slack(analysis, usage_summary=None):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_body = resp.read().decode("utf-8")
             if resp.status == 200:
                 print(f"48 时段 {prefix} Slack 消息与图表推送成功！")
             else:
-                print(f"Slack 返回状态码: {resp.status}")
+                print(f"Slack 返回状态码: {resp.status} - {resp_body}")
+    except urllib.error.HTTPError as e:
+        err_detail = e.read().decode("utf-8", errors="ignore")
+        print(f"发送 Slack 失败 (HTTP {e.code}): {err_detail}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"发送 Slack 失败: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
