@@ -16,5 +16,9 @@ jobs:
       - name: Run Script
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          OCTOPUS_PRODUCT_CODE: "AGILE-24-10-01"
           OCTOPUS_REGION_CODE: "C"
+          OCTOPUS_API_KEY: ${{ secrets.OCTOPUS_API_KEY }}
+          OCTOPUS_MPAN: ${{ secrets.OCTOPUS_MPAN }}
+          OCTOPUS_METER_SERIAL: ${{ secrets.OCTOPUS_METER_SERIAL }}
         run: python main.py
