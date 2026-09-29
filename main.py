@@ -1,17 +1,299 @@
+import base64
+from datetime import datetime, time, timedelta, timezone
 import json
 import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ==================== 配置区域 ====================
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-PRODUCT_CODE = os.getenv("OCTOPUS_PRODUCT_CODE", "AGILE-24-04-03")
-REGION_CODE = os.getenv("OCTOPUS_REGION_CODE", "C")  # 英国电网区域，如 C 为伦敦
+PRODUCT_CODE = os.getenv("OCTOPUS_PRODUCT_CODE", "AGILE-24-10-01")
+REGION_CODE = os.getenv("OCTOPUS_REGION_CODE", "C")  # 英国电网区域，C 为伦敦
 LOW_PRICE_THRESHOLD = 10.0  # 低价报警阈值 (p/kWh)
+
+# 用户电表凭证（用于拉取前一日用电量与电费）
+OCTOPUS_API_KEY = os.getenv("OCTOPUS_API_KEY", "")
+OCTOPUS_MPAN = os.getenv("OCTOPUS_MPAN", "")
+OCTOPUS_METER_SERIAL = os.getenv("OCTOPUS_METER_SERIAL", "")
 # =================================================
+
+
+def fetch_recent_usage_summary():
+    """获取前一日（或最近一个完整回传日）的用电量、电费、高峰用电及 48 时段精细列表。
+
+    若未配置 API Key 或电表，平滑返回 None，不影响明日电价预报。
+    """
+    if not (OCTOPUS_API_KEY and OCTOPUS_MPAN and OCTOPUS_METER_SERIAL):
+        print(
+            "提示: 未配置 OCTOPUS_API_KEY / MPAN / METER_SERIAL，跳过昨日用电复盘。"
+        )
+        return None
+
+    london_tz = ZoneInfo("Europe/London")
+    now = datetime.now(london_tz)
+
+    # 优先检查昨天 (T-1)，若智能电表回传未满 40 条，则平滑回退检查前天 (T-2)
+    candidate_dates = [
+        now.date() - timedelta(days=1),
+        now.date() - timedelta(days=2),
+    ]
+
+    for target_date in candidate_dates:
+        start_dt = datetime.combine(target_date, time.min, tzinfo=london_tz)
+        end_dt = datetime.combine(target_date, time.max, tzinfo=london_tz)
+
+        params = {
+            "period_from": start_dt.isoformat(),
+            "period_to": end_dt.isoformat(),
+            "page_size": 100,
+            "order_by": "period",
+        }
+
+        # 1. 抓取用电量
+        c_url = f"https://api.octopus.energy/v1/electricity-meter-points/{OCTOPUS_MPAN}/meters/{OCTOPUS_METER_SERIAL}/consumption/?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(
+            c_url, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
+        )
+        auth_header = "Basic " + base64.b64encode(
+            f"{OCTOPUS_API_KEY}:".encode("utf-8")
+        ).decode("utf-8")
+        req.add_header("Authorization", auth_header)
+
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                c_results = json.loads(resp.read().decode("utf-8")).get(
+                    "results", []
+                )
+        except Exception as e:
+            print(f"获取 {target_date} 用电数据失败: {e}", file=sys.stderr)
+            continue
+
+        if len(c_results) < 40:
+            print(
+                f"提示: {target_date} 智能电表数据尚未完全同步 (仅 {len(c_results)} 条)，尝试前一日..."
+            )
+            continue
+
+        # 2. 抓取该日对应电价
+        tariff_code = f"E-1R-{PRODUCT_CODE}-{REGION_CODE}"
+        r_url = f"https://api.octopus.energy/v1/products/{PRODUCT_CODE}/electricity-tariffs/{tariff_code}/standard-unit-rates/?{urllib.parse.urlencode(params)}"
+        req_r = urllib.request.Request(
+            r_url, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
+        )
+        try:
+            with urllib.request.urlopen(req_r, timeout=12) as resp:
+                r_results = json.loads(resp.read().decode("utf-8")).get(
+                    "results", []
+                )
+        except Exception as e:
+            print(f"获取 {target_date} 对应电价失败: {e}", file=sys.stderr)
+            continue
+
+        # 3. 按 UTC 时间戳对齐并计算
+        rates_map = {}
+        for r in r_results:
+            dt = datetime.fromisoformat(
+                r["valid_from"].replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            rates_map[dt.strftime("%Y-%m-%dT%H:%M:%SZ")] = float(
+                r["value_inc_vat"]
+            )
+
+        total_kwh = 0.0
+        total_cost_p = 0.0
+        peak_kwh = 0.0
+        peak_cost_p = 0.0
+        rates_sum = 0.0
+        matched = 0
+        matched_slots = []
+
+        for c in c_results:
+            dt = datetime.fromisoformat(
+                c["interval_start"].replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            key = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if key in rates_map:
+                matched += 1
+                k = float(c["consumption"])
+                rate = rates_map[key]
+                cost = k * rate
+                total_kwh += k
+                total_cost_p += cost
+                rates_sum += rate
+
+                dt_local = dt.astimezone(london_tz)
+                is_peak = 16 <= dt_local.hour < 19
+                if is_peak:
+                    peak_kwh += k
+                    peak_cost_p += cost
+
+                matched_slots.append({
+                    "time": dt_local.strftime("%H:%M"),
+                    "kwh": round(k, 4),
+                    "price": round(rate, 2),
+                    "hour": dt_local.hour,
+                    "is_peak": is_peak,
+                })
+
+        matched_slots.sort(key=lambda x: x["time"])
+
+        vwap = (total_cost_p / total_kwh) if total_kwh > 0 else 0
+        mkt_avg = (rates_sum / matched) if matched > 0 else 0
+        peak_pct = (peak_kwh / total_kwh * 100) if total_kwh > 0 else 0
+        peak_vwap = (peak_cost_p / peak_kwh) if peak_kwh > 0 else 0
+        is_yesterday = target_date == (now.date() - timedelta(days=1))
+
+        return {
+            "date": target_date,
+            "is_yesterday": is_yesterday,
+            "total_kwh": total_kwh,
+            "total_cost_gbp": total_cost_p / 100.0,
+            "vwap": vwap,
+            "mkt_avg": mkt_avg,
+            "peak_kwh": peak_kwh,
+            "peak_cost_gbp": peak_cost_p / 100.0,
+            "peak_pct": peak_pct,
+            "peak_vwap": peak_vwap,
+            "diff": mkt_avg - vwap,
+            "matched_slots": matched,
+            "slots": matched_slots,
+        }
+
+    return None
+
+
+def generate_usage_chart_url(usage_summary):
+    """生成前一日【半小时用电量(柱) vs 实时电价(折线)】高清双轴走势图 URL"""
+    if not usage_summary:
+        return None
+    slots = usage_summary.get("slots", [])
+    if not slots:
+        return None
+
+    date_str = usage_summary["date"].strftime("%Y-%m-%d")
+    labels = []
+    kwh_data = []
+    price_data = []
+    bar_colors = []
+
+    for i, s in enumerate(slots):
+        # 每隔 2 小时打一个时间标签，并在高峰 16 点与 19 点打标
+        if i % 4 == 0:
+            labels.append(s["time"][:2])
+        elif i == 32:  # 16:00
+            labels.append("16")
+        elif i == 38:  # 19:00
+            labels.append("19")
+        else:
+            labels.append("")
+
+        kwh_data.append(s["kwh"])
+        price_data.append(s["price"])
+
+        p = s["price"]
+        if p < 0:
+            bar_colors.append("#3B82F6")  # 蓝色：负电价
+        elif p < 12:
+            bar_colors.append("#10B981")  # 绿色：超低电价
+        elif p < 22:
+            bar_colors.append("#34D399")  # 浅绿：常规平价
+        elif s["is_peak"] or p >= 32:
+            bar_colors.append("#EF4444")  # 红色：高峰期 / 高昂电价
+        else:
+            bar_colors.append("#F59E0B")  # 橙黄：适中偏贵
+
+    chart_config = {
+        "type": "bar",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "type": "line",
+                    "label": "实时电价 (p/kWh)",
+                    "data": price_data,
+                    "borderColor": "#FBBF24",
+                    "backgroundColor": "transparent",
+                    "borderWidth": 2.5,
+                    "pointRadius": 2,
+                    "pointBackgroundColor": "#FBBF24",
+                    "yAxisID": "yPrice",
+                },
+                {
+                    "type": "bar",
+                    "label": "半小时用电量 (kWh)",
+                    "data": kwh_data,
+                    "backgroundColor": bar_colors,
+                    "yAxisID": "yKwh",
+                    "categoryPercentage": 0.92,
+                    "barPercentage": 0.95,
+                },
+            ],
+        },
+        "options": {
+            "title": {
+                "display": True,
+                "text": f"用电复盘 ({date_str}): 半小时用电量(柱) vs 实时电价(折线)",
+                "fontSize": 14,
+                "fontColor": "#1E293B",
+            },
+            "legend": {
+                "display": True,
+                "position": "bottom",
+                "labels": {"boxWidth": 12, "fontSize": 11},
+            },
+            "scales": {
+                "yAxes": [
+                    {
+                        "id": "yKwh",
+                        "type": "linear",
+                        "position": "left",
+                        "ticks": {"beginAtZero": True, "fontSize": 10},
+                        "scaleLabel": {
+                            "display": True,
+                            "labelString": "用电量 (kWh)",
+                            "fontSize": 11,
+                        },
+                    },
+                    {
+                        "id": "yPrice",
+                        "type": "linear",
+                        "position": "right",
+                        "ticks": {"fontSize": 10},
+                        "scaleLabel": {
+                            "display": True,
+                            "labelString": "单价 (p/kWh)",
+                            "fontSize": 11,
+                        },
+                        "gridLines": {"drawOnChartArea": False},
+                    },
+                ],
+                "xAxes": [
+                    {
+                        "gridLines": {"display": False},
+                        "ticks": {
+                            "autoSkip": False,
+                            "maxRotation": 0,
+                            "fontSize": 10,
+                        },
+                    }
+                ],
+            },
+        },
+    }
+
+    config_str = urllib.parse.quote(
+        json.dumps(chart_config, separators=(",", ":"))
+    )
+    chart_url = f"https://quickchart.io/chart?w=740&h=290&devicePixelRatio=2&bkg=white&c={config_str}"
+    return chart_url
 
 
 def fetch_agile_prices():
@@ -37,7 +319,7 @@ def fetch_agile_prices():
     }
     url_tomorrow = f"{base_url}?{urllib.parse.urlencode(params_tomorrow)}"
     req_tomorrow = urllib.request.Request(
-        url_tomorrow, headers={"User-Agent": "OctopusAgileSlackBot/2.2"}
+        url_tomorrow, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
     )
 
     try:
@@ -47,13 +329,17 @@ def fetch_agile_prices():
             # 只要获取到明天的数据（通常为 48 个半小时时段）
             if results and len(results) >= 24:
                 results.sort(key=lambda x: x["valid_from"])
-                print(f"成功获取到明天 ({tomorrow}) 全部 {len(results)} 个时段电价！")
+                print(
+                    f"成功获取到明天 ({tomorrow}) 全部 {len(results)} 个时段电价！"
+                )
                 return results, tomorrow, True
     except Exception as e:
         print(f"尝试拉取明天电价时提示: {e}", file=sys.stderr)
 
     # 2. 如果明天数据尚未发布，自动回退拉取今天（Today）的数据
-    print("提示：明天电价尚未发布（通常在英国时间 16:00 左右公布），自动回退显示今日数据。")
+    print(
+        "提示：明天电价尚未发布（通常在英国时间 16:00 左右公布），自动回退显示今日数据。"
+    )
     today = now.date()
     start_today = datetime.combine(today, time.min, tzinfo=london_tz)
     end_today = datetime.combine(today, time.max, tzinfo=london_tz)
@@ -65,7 +351,7 @@ def fetch_agile_prices():
     }
     url_today = f"{base_url}?{urllib.parse.urlencode(params_today)}"
     req_today = urllib.request.Request(
-        url_today, headers={"User-Agent": "OctopusAgileSlackBot/2.2"}
+        url_today, headers={"User-Agent": "OctopusAgileSlackBot/3.0"}
     )
 
     try:
@@ -183,8 +469,8 @@ def analyze_prices(rates, target_date, is_tomorrow):
     }
 
 
-def generate_chart_url(analysis, date_str):
-    """生成 48 根半小时柱状图的高清图表 URL"""
+def generate_forecast_chart_url(analysis, date_str):
+    """生成次日 48 根半小时柱状图的高清图表 URL"""
     day_type = "明日" if analysis["is_tomorrow"] else "全天"
     chart_config = {
         "type": "bar",
@@ -224,13 +510,15 @@ def generate_chart_url(analysis, date_str):
         },
     }
 
-    config_str = urllib.parse.quote(json.dumps(chart_config, separators=(",", ":")))
+    config_str = urllib.parse.quote(
+        json.dumps(chart_config, separators=(",", ":"))
+    )
     chart_url = f"https://quickchart.io/chart?w=740&h=280&devicePixelRatio=2&bkg=white&c={config_str}"
     return chart_url
 
 
-def send_to_slack(analysis):
-    """发送包含次日半小时柱状图和 10p 报警的 Slack 卡片"""
+def send_to_slack(analysis, usage_summary=None):
+    """发送包含昨日用电复盘(数据+双轴图)、次日半小时柱状图和 10p 报警的 Slack 卡片"""
     if not analysis:
         return
 
@@ -266,7 +554,80 @@ def send_to_slack(analysis):
                 "text": header_title,
                 "emoji": True,
             },
-        },
+        }
+    ]
+
+    # ========== 模块 1: 前一日（或最新）用电量与电费复盘 + 双轴对齐图 ==========
+    if usage_summary:
+        u_date = usage_summary["date"].strftime("%Y-%m-%d (%A)")
+        title_tag = (
+            "📋 *【昨日用电复盘】*"
+            if usage_summary["is_yesterday"]
+            else "📋 *【最新完整用电复盘】* _(昨日电表未回传完全)_"
+        )
+
+        diff = usage_summary["diff"]
+        if diff > 0.5:
+            eval_str = f"🎉 *避峰出色！* 比市场均价低 `{diff:.1f}p` (省约 `{(diff / usage_summary['mkt_avg']) * 100:.0f}%`)"
+        elif diff < -0.5:
+            eval_str = f"⚠️ *高峰用电偏多*，均价比市场高 `{abs(diff):.1f}p`"
+        else:
+            eval_str = "⚖️ 与市场基准均价基本持平"
+
+        usage_fields = [
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"*⚡ 结算总用电:*\n`{usage_summary['total_kwh']:.2f} kWh`"
+                    f" (加权均价 `{usage_summary['vwap']:.1f}p`)"
+                ),
+            },
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"*💰 纯电费支出:*\n`£{usage_summary['total_cost_gbp']:.2f}`"
+                ),
+            },
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"*🔥 晚高峰 (16-19点):*\n`{usage_summary['peak_kwh']:.2f} kWh`"
+                    f" (占 `{usage_summary['peak_pct']:.1f}%`，花费"
+                    f" `£{usage_summary['peak_cost_gbp']:.2f}`)"
+                ),
+            },
+            {"type": "mrkdwn", "text": f"*🎯 避峰评价:*\n{eval_str}"},
+        ]
+
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{title_tag} *{u_date}*",
+                },
+                "fields": usage_fields,
+            }
+        )
+
+        # 嵌入前一日【用电量柱状图 + 电价折线图】双轴图
+        usage_chart_url = generate_usage_chart_url(usage_summary)
+        if usage_chart_url:
+            blocks.append({
+                "type": "image",
+                "title": {
+                    "type": "plain_text",
+                    "text": f"📊 用电复盘走势: 半小时用电量(柱) vs 实时电价(折线) - {u_date}",
+                    "emoji": True,
+                },
+                "image_url": usage_chart_url,
+                "alt_text": "用电量与电价双轴对齐图",
+            })
+
+        blocks.append({"type": "divider"})
+
+    # ========== 模块 2: 次日电价预报概览 ==========
+    blocks.append(
         {
             "type": "section",
             "fields": [
@@ -284,8 +645,8 @@ def send_to_slack(analysis):
                     "text": f"*🔴 {prefix}峰值:*\n`{analysis['max_slot']['price']:.1f} p` ({max_time})",
                 },
             ],
-        },
-    ]
+        }
+    )
 
     # 低于 10p 警报模块
     if analysis["low_price_slots"]:
@@ -336,8 +697,8 @@ def send_to_slack(analysis):
             }
         )
 
-    # 48 根半小时柱状图
-    chart_url = generate_chart_url(analysis, date_str)
+    # 次日 48 根半小时柱状图
+    forecast_chart_url = generate_forecast_chart_url(analysis, date_str)
     blocks.append(
         {
             "type": "image",
@@ -346,7 +707,7 @@ def send_to_slack(analysis):
                 "text": f"📊 {prefix} 48 个半小时时段电价走势 (绿色为 <10p 低价，红色为高峰)",
                 "emoji": True,
             },
-            "image_url": chart_url,
+            "image_url": forecast_chart_url,
             "alt_text": f"{prefix}48个半小时电价走势图",
         }
     )
@@ -368,7 +729,7 @@ def send_to_slack(analysis):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 200:
-                print(f"48 时段 {prefix} Slack 消息与高清柱状图推送成功！")
+                print(f"48 时段 {prefix} Slack 消息与图表推送成功！")
             else:
                 print(f"Slack 返回状态码: {resp.status}")
     except Exception as e:
@@ -376,10 +737,14 @@ def send_to_slack(analysis):
 
 
 if __name__ == "__main__":
+    # 1. 尝试拉取昨日用电与电费
+    usage_summary = fetch_recent_usage_summary()
+
+    # 2. 拉取今日/次日电价并推送
     rates, target_date, is_tomorrow = fetch_agile_prices()
     if not rates:
         print("未获取到有效电价数据。")
         sys.exit(1)
 
     analysis = analyze_prices(rates, target_date, is_tomorrow)
-    send_to_slack(analysis)
+    send_to_slack(analysis, usage_summary)
