@@ -19,7 +19,7 @@ PRODUCT_CODE = os.getenv("OCTOPUS_PRODUCT_CODE", "AGILE-24-10-01")
 REGION_CODE = os.getenv("OCTOPUS_REGION_CODE", "C")  # 英国电网区域，C 为伦敦
 LOW_PRICE_THRESHOLD = 10.0  # 低价报警阈值 (p/kWh)
 
-# 用户电表凭证（用于拉取前一日用电量与电费）
+# 用户电表凭证（通过 GitHub Secrets / 环境变量安全读取，代码内无任何明文凭证）
 OCTOPUS_API_KEY = os.getenv("OCTOPUS_API_KEY", "")
 OCTOPUS_MPAN = os.getenv("OCTOPUS_MPAN", "")
 OCTOPUS_METER_SERIAL = os.getenv("OCTOPUS_METER_SERIAL", "")
