@@ -700,25 +700,52 @@ def send_to_slack(analysis, usage_summary=None):
         print("警告: 未设置 SLACK_WEBHOOK_URL，跳过发送。Payload 构造正常。")
         return
 
-    req = urllib.request.Request(
-        SLACK_WEBHOOK_URL,
-        data=json.dumps(slack_payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_body = resp.read().decode("utf-8")
-            if resp.status == 200:
-                print(f"48 时段 {prefix} Slack 消息与图表推送成功！")
-            else:
-                print(f"Slack 返回状态码: {resp.status} - {resp_body}")
-    except urllib.error.HTTPError as e:
-        err_detail = e.read().decode("utf-8", errors="ignore")
-        print(f"发送 Slack 失败 (HTTP {e.code}): {err_detail}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"发送 Slack 失败: {e}", file=sys.stderr)
-        sys.exit(1)
+    # 仅在 Slack 明确拒绝卡片时降级；网络超时不重发，避免重复通知。
+    text_parts = [slack_payload["text"]]
+    for block in blocks:
+        if block.get("type") == "image":
+            continue
+        if block.get("text", {}).get("text"):
+            text_parts.append(block["text"]["text"])
+        for item in block.get("fields", []) + block.get("elements", []):
+            if item.get("text"):
+                text_parts.append(item["text"])
+    plain_text = "\n\n".join(text_parts)
+    without_images = [b for b in blocks if b.get("type") != "image"]
+    candidates = [
+        ("原始图文", slack_payload),
+        ("无图片卡片", {"text": slack_payload["text"], "blocks": without_images}),
+        ("文字摘要", {"text": plain_text}),
+    ]
+    for index, (label, payload) in enumerate(candidates):
+        if index == 0:
+            for block_index, block in enumerate(blocks):
+                if block.get("type") == "image":
+                    print(f"图片 block[{block_index}] URL 长度: {len(block.get('image_url', ''))}")
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8")
+                if resp.status == 200 and body.strip() == "ok":
+                    print(f"{prefix} Slack 推送成功（{label}）。")
+                    return
+                print(f"Slack 返回异常状态: {resp.status}", file=sys.stderr)
+                sys.exit(1)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            # 不输出 URL、凭证或完整请求体。
+            if exc.code == 400 and detail == "invalid_blocks" and index < 2:
+                print(f"Slack 拒绝{label} (invalid_blocks)，尝试{candidates[index + 1][0]}。", file=sys.stderr)
+                continue
+            print(f"发送 Slack 失败 (HTTP {exc.code})，模式: {label}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"发送 Slack 失败，模式: {label}，异常类型: {type(exc).__name__}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
