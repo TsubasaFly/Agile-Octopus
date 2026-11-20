@@ -15,7 +15,14 @@
      - `📑 对比明细表`：展示完整财务与能耗指标，包含负电价收益与全年 Grand Total 汇总行。
    - 增加**全局月份筛选联动**：顶部提供 `全部月份` 及各单月筛选胶囊，选中后自动下钻联动下方的“每日用电走势图”与“48 时段精细走势图”。
 
-2. **自动加载本地凭据 (`API key.txt`)**:
+2. **GitHub 仓库与 GitHub Pages 直连上线**:
+   - 直接向远程仓库 `TsubasaFly/Agile-Octopus` 推送了 `build_dashboard.py`、`CHANGELOG.md` 与更新后的 `README.md`。
+   - 自动更新了 GitHub Actions Secret `OCTOPUS_API_KEY` 为最新轮换的有效 Key。
+   - 激活并配置了 GitHub Pages（部署源指向 `gh-pages` 分支），推送了全量渲染仪表盘及 `.nojekyll`。
+   - 成功恢复线上看板访问：[https://tsubasafly.github.io/Agile-Octopus/](https://tsubasafly.github.io/Agile-Octopus/) (HTTP 200 OK)。
+   - 在本地 `update_all.py` 中集成了 `Step 3` 自动发布逻辑，本地一键更新即可直接同步推送到 GitHub Pages。
+
+3. **自动加载本地凭据 (`API key.txt`)**:
    - `download_and_analyze.py` 与 `build_dashboard.py` 支持自动识别并读取同目录下 `API key.txt`，支持格式 `OCTOPUS_API_KEY=xxx`，避免在代码中硬编码敏感信息。
 
 3. **双构建引擎同步升级**:
